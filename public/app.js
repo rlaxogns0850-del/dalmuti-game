@@ -18,6 +18,10 @@ let state = {
   selected: new Set(),
 };
 
+let timerInterval = null;
+let rulesAutoShown = false;
+
+/* ===================== 유틸 ===================== */
 function saveSession() {
   if (state.userId) localStorage.setItem("dalmuti_userId", state.userId);
   if (state.roomCode) localStorage.setItem("dalmuti_roomCode", state.roomCode);
@@ -33,7 +37,20 @@ function showToast(msg) {
   setTimeout(() => el.remove(), 2500);
 }
 
-/* ---------------- 화면: 입장 / 방 생성 ---------------- */
+/* ===================== 방 나가기 (모든 화면 공통) ===================== */
+function leaveRoom() {
+  socket.emit("room:leave");
+  state.room = null;
+  state.roomCode = null;
+  state.myHand = [];
+  state.selected.clear();
+  rulesAutoShown = false;
+  localStorage.removeItem("dalmuti_roomCode");
+  clearInterval(timerInterval);
+  render();
+}
+
+/* ===================== 화면: 홈 ===================== */
 function renderHome() {
   app.innerHTML = `
     <div class="row"><h1 class="serif" style="color:var(--gold)">달무티</h1></div>
@@ -60,7 +77,7 @@ function renderHome() {
   document.getElementById("createBtn").onclick = () => {
     if (!state.nickname.trim()) return showToast("닉네임을 입력해주세요");
     socket.emit("room:create", { nickname: state.nickname, avatar: state.avatar, userId: state.userId }, (res) => {
-      if (!res.ok) return showToast("방 생성 실패");
+      if (!res || !res.ok) return showToast("방 생성 실패");
       state.userId = res.userId;
       state.roomCode = res.roomCode;
       saveSession();
@@ -72,7 +89,7 @@ function renderHome() {
     if (!state.nickname.trim()) return showToast("닉네임을 입력해주세요");
     if (!code) return showToast("입장 코드를 입력해주세요");
     socket.emit("room:join", { roomCode: code, nickname: state.nickname, avatar: state.avatar, userId: state.userId }, (res) => {
-      if (!res.ok) return showToast(res.code === "ROOM_FULL" ? "방이 가득 찼습니다" : "방을 찾을 수 없습니다");
+      if (!res || !res.ok) return showToast(res?.code === "ROOM_FULL" ? "방이 가득 찼습니다" : "방을 찾을 수 없습니다");
       state.userId = res.userId;
       state.roomCode = res.roomCode;
       saveSession();
@@ -80,9 +97,7 @@ function renderHome() {
   };
 }
 
-/* ---------------- 화면: 대기실 ---------------- */
-let rulesAutoShown = false;
-
+/* ===================== 화면: 대기실 ===================== */
 function renderWaitingRoom() {
   const room = state.room;
   const isHost = room.hostUserId === state.userId;
@@ -147,7 +162,7 @@ function renderWaitingRoom() {
   }
 }
 
-/* ---------------- 화면: 세금 징수 ---------------- */
+/* ===================== 화면: 세금 징수 ===================== */
 function renderTax() {
   const room = state.room;
   const tax = room.taxExchange;
@@ -156,8 +171,13 @@ function renderTax() {
   const myJokers = state.myHand.filter((c) => c.isJoker).length;
 
   app.innerHTML = `
-    <div class="row"><h1 class="serif" style="color:var(--gold);font-size:20px;">세금 징수 (라운드 ${room.roundNumber})</h1>
-      <button id="rulesBtn" class="icon-btn">❓ 규칙 보기</button></div>
+    <div class="row">
+      <h1 class="serif" style="color:var(--gold);font-size:20px;">세금 징수 (라운드 ${room.roundNumber})</h1>
+      <div style="display:flex;gap:6px;">
+        <button id="rulesBtn" class="icon-btn">❓ 규칙 보기</button>
+        <button id="leaveBtn" class="icon-btn" style="border-color:var(--muted);color:var(--muted);">🚪 나가기</button>
+      </div>
+    </div>
     <div class="tax-box">
       ${isKing ? "<p>👑 왕입니다. 노예에게 내려줄 카드를 선택하세요.</p>" : ""}
       ${isPeon ? "<p>🪓 노예입니다. 왕에게 바칠 가장 좋은 카드를 선택하세요.</p>" : ""}
@@ -166,7 +186,12 @@ function renderTax() {
     ${isKing || isPeon ? `<div class="hand" id="taxHand"></div><div class="actions"><button id="taxSubmitBtn" class="btn btn-primary">제출</button></div>` : ""}
     ${myJokers >= 2 ? `<div class="actions"><button id="revolutionBtn" class="btn btn-gold">⚡ 혁명 선언 (조커 2장 보유)</button></div>` : ""}
   `;
+
   document.getElementById("rulesBtn").onclick = () => rulesModal.classList.remove("hidden");
+  document.getElementById("leaveBtn").onclick = () => {
+    if (!confirm("게임 도중 나가면 대기실로 초기화됩니다. 나가시겠습니까?")) return;
+    leaveRoom();
+  };
 
   const revBtn = document.getElementById("revolutionBtn");
   if (revBtn) revBtn.onclick = () => socket.emit("tax:declareRevolution");
@@ -192,9 +217,7 @@ function renderTax() {
   }
 }
 
-/* ---------------- 화면: 게임 테이블 ---------------- */
-let timerInterval = null;
-
+/* ===================== 화면: 게임 테이블 ===================== */
 function renderGameTable() {
   const room = state.room;
   const trick = room.currentTrick;
@@ -208,14 +231,12 @@ function renderGameTable() {
       </div>
       <div style="display:flex;gap:6px;">
         <button id="rulesBtn" class="icon-btn">❓ 규칙 보기</button>
-        <button id="leaveGameBtn" class="icon-btn" style="border-color:var(--muted);color:var(--muted);">🚪 나가기</button>
+        <button id="leaveBtn" class="icon-btn" style="border-color:var(--muted);color:var(--muted);">🚪 나가기</button>
       </div>
     </div>
 
     <div class="player-grid" id="playerGrid"></div>
-
     <div class="field" id="field"></div>
-
     <div class="hand" id="hand"></div>
 
     <div class="actions">
@@ -225,7 +246,7 @@ function renderGameTable() {
   `;
 
   document.getElementById("rulesBtn").onclick = () => rulesModal.classList.remove("hidden");
-  document.getElementById("leaveGameBtn").onclick = () => {
+  document.getElementById("leaveBtn").onclick = () => {
     if (!confirm("게임 도중 나가면 대기실로 초기화됩니다. 나가시겠습니까?")) return;
     leaveRoom();
   };
@@ -234,8 +255,10 @@ function renderGameTable() {
   room.players.forEach((p) => {
     const div = document.createElement("div");
     const level = p.rank?.level || 6;
-    div.className = "player-card" + (p.rank?.isKing ? " king" : "") + (p.rank?.isPeon ? " peon" : "") +
-      (trick?.currentTurnUserId === p.userId ? " current-turn" : "");
+    div.className = "player-card"
+      + (p.rank?.isKing ? " king" : "")
+      + (p.rank?.isPeon ? " peon" : "")
+      + (trick?.currentTurnUserId === p.userId ? " current-turn" : "");
     div.innerHTML = `
       ${p.rank?.isKing ? `<span class="crown">👑</span>` : ""}
       <span class="avatar">${p.avatar}</span>
@@ -292,7 +315,7 @@ function renderGameTable() {
   }
 }
 
-/* ---------------- 라우팅 ---------------- */
+/* ===================== 라우터 ===================== */
 function render() {
   const room = state.room;
   if (!room) return renderHome();
@@ -302,17 +325,20 @@ function render() {
   return renderHome();
 }
 
-/* ---------------- 소켓 이벤트 ---------------- */
+/* ===================== 소켓 이벤트 ===================== */
 socket.on("connect", () => {
   if (state.userId && state.roomCode) {
     socket.emit("room:join", {
-      roomCode: state.roomCode, nickname: state.nickname, avatar: state.avatar, userId: state.userId,
+      roomCode: state.roomCode,
+      nickname: state.nickname,
+      avatar: state.avatar,
+      userId: state.userId,
     }, (res) => {
-      if (!res.ok) {
+      if (!res || !res.ok) {
         state.roomCode = null;
         localStorage.removeItem("dalmuti_roomCode");
-        render();
       }
+      render();
     });
   } else {
     render();
@@ -330,22 +356,19 @@ socket.on("game:hand", ({ hand }) => {
   render();
 });
 
-socket.on("round:ended", ({ finishOrder }) => {
-  showToast("라운드 종료! 다음 라운드를 준비합니다...");
-});
-
+socket.on("round:ended", () => showToast("라운드 종료! 다음 라운드를 준비합니다..."));
 socket.on("tax:completed", () => showToast("세금 징수가 완료되었습니다"));
-socket.on("tax:skippedByRevolution", ({ userId }) => showToast("⚡ 혁명 선언! 세금 징수를 건너뜁니다"));
+socket.on("tax:skippedByRevolution", () => showToast("⚡ 혁명 선언! 세금 징수를 건너뜁니다"));
 socket.on("trick:allPassed", () => showToast("모두 패스! 새 턴이 시작됩니다"));
-socket.on("player:disconnected", ({ userId }) => showToast("플레이어 연결이 끊겼습니다 (재접속 대기 중)"));
+socket.on("player:disconnected", () => showToast("플레이어 연결이 끊겼습니다 (재접속 대기 중)"));
 socket.on("player:reconnected", () => showToast("플레이어가 재접속했습니다"));
+
 socket.on("player:finished", ({ userId, place }) => {
   if (userId === state.userId) showToast(`카드를 모두 냈습니다! ${place}등으로 마감`);
 });
 
 socket.on("player:left", ({ userId }) => {
-  const room = state.room;
-  const name = room?.players?.find(p => p.userId === userId)?.nickname || "플레이어";
+  const name = state.room?.players?.find(p => p.userId === userId)?.nickname || "플레이어";
   showToast(`${name}님이 방을 나갔습니다`);
 });
 
@@ -354,25 +377,22 @@ socket.on("room:hostChanged", ({ nickname }) => {
 });
 
 socket.on("room:resetToLobby", ({ reason }) => {
-  showToast(reason);
   state.myHand = [];
   state.selected.clear();
+  showToast(reason);
 });
 
+// 방장이 방 삭제 → 나를 포함 모두 강제 홈으로
 socket.on("room:closed", ({ reason }) => {
   showToast(reason || "방이 삭제되었습니다");
-  leaveRoom();
-});
-
-function leaveRoom() {
-  socket.emit("room:leave");
   state.room = null;
   state.roomCode = null;
   state.myHand = [];
   state.selected.clear();
+  rulesAutoShown = false;
   localStorage.removeItem("dalmuti_roomCode");
   clearInterval(timerInterval);
   render();
-}
+});
 
 render();
