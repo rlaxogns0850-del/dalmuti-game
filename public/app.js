@@ -100,6 +100,10 @@ function renderWaitingRoom() {
       <button id="readyBtn" class="btn" style="flex:1;">${me?.isReady ? "준비 취소" : "준비완료"}</button>
       ${isHost ? `<button id="startBtn" class="btn btn-gold" style="flex:1;">게임 시작</button>` : ""}
     </div>
+    <div class="actions" style="margin-top:8px;">
+      <button id="leaveBtn" class="btn" style="flex:1;border-color:var(--muted);color:var(--muted);">🚪 방 나가기</button>
+      ${isHost ? `<button id="closeBtn" class="btn btn-primary" style="flex:1;">❌ 방 삭제</button>` : ""}
+    </div>
   `;
 
   const grid = document.getElementById("playerGrid");
@@ -116,6 +120,20 @@ function renderWaitingRoom() {
 
   document.getElementById("rulesBtn").onclick = () => rulesModal.classList.remove("hidden");
   document.getElementById("readyBtn").onclick = () => socket.emit("player:ready");
+
+  document.getElementById("leaveBtn").onclick = () => {
+    if (!confirm("방에서 나가시겠습니까?")) return;
+    leaveRoom();
+  };
+
+  const closeBtn = document.getElementById("closeBtn");
+  if (closeBtn) {
+    closeBtn.onclick = () => {
+      if (!confirm("방을 삭제하면 모든 플레이어가 강제 퇴장됩니다. 삭제하시겠습니까?")) return;
+      socket.emit("room:close");
+    };
+  }
+
   const startBtn = document.getElementById("startBtn");
   if (startBtn) {
     const canStart = room.players.length >= room.minPlayers && room.players.length <= room.maxPlayers;
@@ -188,7 +206,10 @@ function renderGameTable() {
         <div class="timer-bar"><div class="timer-bar-fill" id="timerFill" style="width:100%"></div></div>
         <span class="timer-text" id="timerText">30s</span>
       </div>
-      <button id="rulesBtn" class="icon-btn">❓ 규칙 보기</button>
+      <div style="display:flex;gap:6px;">
+        <button id="rulesBtn" class="icon-btn">❓ 규칙 보기</button>
+        <button id="leaveGameBtn" class="icon-btn" style="border-color:var(--muted);color:var(--muted);">🚪 나가기</button>
+      </div>
     </div>
 
     <div class="player-grid" id="playerGrid"></div>
@@ -204,6 +225,10 @@ function renderGameTable() {
   `;
 
   document.getElementById("rulesBtn").onclick = () => rulesModal.classList.remove("hidden");
+  document.getElementById("leaveGameBtn").onclick = () => {
+    if (!confirm("게임 도중 나가면 대기실로 초기화됩니다. 나가시겠습니까?")) return;
+    leaveRoom();
+  };
 
   const grid = document.getElementById("playerGrid");
   room.players.forEach((p) => {
@@ -317,5 +342,37 @@ socket.on("player:reconnected", () => showToast("플레이어가 재접속했습
 socket.on("player:finished", ({ userId, place }) => {
   if (userId === state.userId) showToast(`카드를 모두 냈습니다! ${place}등으로 마감`);
 });
+
+socket.on("player:left", ({ userId }) => {
+  const room = state.room;
+  const name = room?.players?.find(p => p.userId === userId)?.nickname || "플레이어";
+  showToast(`${name}님이 방을 나갔습니다`);
+});
+
+socket.on("room:hostChanged", ({ nickname }) => {
+  showToast(`👑 ${nickname}님이 새 방장이 되었습니다`);
+});
+
+socket.on("room:resetToLobby", ({ reason }) => {
+  showToast(reason);
+  state.myHand = [];
+  state.selected.clear();
+});
+
+socket.on("room:closed", ({ reason }) => {
+  showToast(reason || "방이 삭제되었습니다");
+  leaveRoom();
+});
+
+function leaveRoom() {
+  socket.emit("room:leave");
+  state.room = null;
+  state.roomCode = null;
+  state.myHand = [];
+  state.selected.clear();
+  localStorage.removeItem("dalmuti_roomCode");
+  clearInterval(timerInterval);
+  render();
+}
 
 render();
