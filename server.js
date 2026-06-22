@@ -466,6 +466,65 @@ io.on("connection", (socket) => {
     handlePass(room, socket.data.userId, false);
   });
 
+  // 방 나가기 (일반 플레이어)
+  socket.on("room:leave", () => {
+    const room = rooms.get(socket.data.roomCode);
+    const uid = socket.data.userId;
+    if (!room || !uid) return;
+
+    clearTurnTimer(room);
+    room.players.delete(uid);
+    room.seatOrder = room.seatOrder.filter((id) => id !== uid);
+    sessions.delete(uid);
+    socket.leave(room.roomCode);
+    socket.data.roomCode = null;
+
+    // 방이 비었으면 삭제
+    if (room.players.size === 0) {
+      rooms.delete(room.roomCode);
+      return;
+    }
+
+    // 호스트가 나간 경우 다음 사람에게 호스트 이전
+    if (room.hostUserId === uid) {
+      room.hostUserId = room.seatOrder[0];
+      const newHost = room.players.get(room.hostUserId);
+      io.to(room.roomCode).emit("room:hostChanged", { newHostUserId: room.hostUserId, nickname: newHost?.nickname });
+    }
+
+    // 게임 중이었으면 대기실로 리셋
+    if (room.status !== "waiting") {
+      room.status = "waiting";
+      room.currentTrick = null;
+      room.taxExchange = null;
+      room.finishOrder = [];
+      room.roundNumber = 0;
+      room.players.forEach((p) => { p.hand = []; p.isReady = false; p.rank = null; });
+      io.to(room.roomCode).emit("room:resetToLobby", { reason: `${room.players.get(uid)?.nickname || "플레이어"}님이 나갔습니다. 대기실로 돌아갑니다.` });
+    }
+
+    io.to(room.roomCode).emit("player:left", { userId: uid });
+    broadcastRoom(room);
+  });
+
+  // 방 강제 종료 (호스트 전용)
+  socket.on("room:close", () => {
+    const room = rooms.get(socket.data.roomCode);
+    if (!room) return;
+    if (socket.data.userId !== room.hostUserId) return;
+
+    clearTurnTimer(room);
+    io.to(room.roomCode).emit("room:closed", { reason: "방장이 방을 닫았습니다." });
+
+    // 모든 소켓을 방에서 강제 퇴장
+    room.players.forEach((p) => {
+      const s = io.sockets.sockets.get(p.socketId);
+      if (s) { s.leave(room.roomCode); s.data.roomCode = null; }
+      sessions.delete(p.userId);
+    });
+    rooms.delete(room.roomCode);
+  });
+
   socket.on("disconnect", () => {
     const room = rooms.get(socket.data.roomCode);
     const uid = socket.data.userId;
