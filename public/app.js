@@ -1,398 +1,750 @@
-const socket = io();
+const express = require("express");
+const http = require("http");
+const path = require("path");
+const { Server } = require("socket.io");
+const { v4: uuidv4 } = require("uuid");
+const { dealCards } = require("./deck");
 
-const AVATARS = ["🦊", "🐺", "🦅", "🐻", "🦁", "🐗", "🦉", "🐍"];
-const RANK_TITLES = ["대달무티", "소달무티", "총리대신", "재판관", "기사", "성직자", "상인", "장인", "농부", "광부", "소농노", "대농노"];
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: "*" } });
 
-const app = document.getElementById("app");
-const rulesModal = document.getElementById("rulesModal");
-document.getElementById("closeRulesBtn").onclick = () => rulesModal.classList.add("hidden");
-document.getElementById("rulesOkBtn").onclick = () => rulesModal.classList.add("hidden");
+app.use(express.static(path.join(__dirname, "public")));
 
-let state = {
-  userId: localStorage.getItem("dalmuti_userId") || null,
-  roomCode: localStorage.getItem("dalmuti_roomCode") || null,
-  nickname: localStorage.getItem("dalmuti_nickname") || "",
-  avatar: localStorage.getItem("dalmuti_avatar") || AVATARS[0],
-  room: null,
-  myHand: [],
-  selected: new Set(),
-};
+const PORT = process.env.PORT || 3000;
+const TURN_TIME_LIMIT_SEC = 30;
+const RECONNECT_GRACE_MS = 60000;
+const BOT_THINK_MS = 1500; // 봇이 생각하는 척하는 딜레이
 
-let timerInterval = null;
-let rulesAutoShown = false;
+const RANK_TITLES = [
+  "대달무티", "소달무티", "총리대신", "재판관", "기사",
+  "성직자", "상인", "장인", "농부", "광부", "소농노", "대농노",
+];
 
-/* ===================== 유틸 ===================== */
-function saveSession() {
-  if (state.userId) localStorage.setItem("dalmuti_userId", state.userId);
-  if (state.roomCode) localStorage.setItem("dalmuti_roomCode", state.roomCode);
-  localStorage.setItem("dalmuti_nickname", state.nickname);
-  localStorage.setItem("dalmuti_avatar", state.avatar);
+const BOT_NAMES   = ["루피봇", "조로봇", "나미봇", "상디봇", "쵸파봇", "로빈봇", "프랑키봇", "브룩봇"];
+const BOT_AVATARS = ["🤖", "👾", "🎮", "🃏", "♟️", "🎲", "🦾", "🧠"];
+
+const rooms   = new Map(); // roomCode -> room
+const sessions = new Map(); // userId  -> { roomCode, disconnectTimer }
+
+/* ====================================================
+   유틸
+   ==================================================== */
+function makeRoomCode() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let code;
+  do {
+    code = Array.from({ length: 5 }, () => chars[Math.floor(Math.random() * chars.length)]).join("");
+  } while (rooms.has(code));
+  return code;
 }
 
-function showToast(msg) {
-  const el = document.createElement("div");
-  el.className = "toast";
-  el.textContent = msg;
-  document.body.appendChild(el);
-  setTimeout(() => el.remove(), 2500);
+function publicRoomState(room) {
+  return {
+    roomCode:       room.roomCode,
+    status:         room.status,
+    hostUserId:     room.hostUserId,
+    maxPlayers:     room.maxPlayers,
+    minPlayers:     room.minPlayers,
+    turnTimeLimitSec: TURN_TIME_LIMIT_SEC,
+    roundNumber:    room.roundNumber,
+    players: room.seatOrder
+      .map((uid) => room.players.get(uid))
+      .filter(Boolean)
+      .map((p) => ({
+        userId:    p.userId,
+        nickname:  p.nickname,
+        avatar:    p.avatar,
+        isBot:     p.isBot || false,
+        seatIndex: p.seatIndex,
+        rank:      p.rank,
+        handCount: p.hand.length,
+        connected: p.connected,
+        isReady:   p.isReady,
+      })),
+    currentTrick: room.currentTrick ? {
+      fieldCards:        room.currentTrick.fieldCards,
+      currentTurnUserId: room.currentTrick.turnOrder[room.currentTrick.currentTurnIndex] || null,
+      turnDeadline:      room.currentTrick.turnDeadline,
+      passedPlayers:     Array.from(room.currentTrick.passedPlayers),
+    } : null,
+    taxExchange: room.taxExchange,
+  };
 }
 
-/* ===================== 방 나가기 (모든 화면 공통) ===================== */
-function leaveRoom() {
-  socket.emit("room:leave");
-  state.room = null;
-  state.roomCode = null;
-  state.myHand = [];
-  state.selected.clear();
-  rulesAutoShown = false;
-  localStorage.removeItem("dalmuti_roomCode");
-  clearInterval(timerInterval);
-  render();
+function broadcastRoom(room) {
+  io.to(room.roomCode).emit("room:state", publicRoomState(room));
 }
 
-/* ===================== 화면: 홈 ===================== */
-function renderHome() {
-  app.innerHTML = `
-    <div class="row"><h1 class="serif" style="color:var(--gold)">달무티</h1></div>
-    <div class="panel">
-      <label>닉네임</label>
-      <input id="nicknameInput" type="text" placeholder="이름을 입력하세요" value="${state.nickname}" />
-      <div class="avatar-grid" id="avatarGrid"></div>
-      <button id="createBtn" class="btn btn-gold" style="width:100%;margin-bottom:10px;">방 만들기</button>
-      <input id="roomCodeInput" type="text" placeholder="입장 코드 입력" style="text-transform:uppercase" />
-      <button id="joinBtn" class="btn btn-primary" style="width:100%;">방 입장하기</button>
-    </div>
-  `;
-  const grid = document.getElementById("avatarGrid");
-  AVATARS.forEach((a) => {
-    const b = document.createElement("button");
-    b.className = "avatar-option" + (a === state.avatar ? " selected" : "");
-    b.textContent = a;
-    b.onclick = () => { state.avatar = a; renderHome(); };
-    grid.appendChild(b);
+function getSocketForUser(room, userId) {
+  const p = room.players.get(userId);
+  if (!p) return null;
+  return io.sockets.sockets.get(p.socketId) || null;
+}
+
+function sendHandToPlayer(room, userId) {
+  const sock = getSocketForUser(room, userId);
+  const p    = room.players.get(userId);
+  if (sock && p) sock.emit("game:hand", { hand: p.hand });
+}
+
+function currentTurnUserId(room) {
+  const t = room.currentTrick;
+  if (!t) return null;
+  return t.turnOrder[t.currentTurnIndex];
+}
+
+/* ====================================================
+   타이머 — 핵심 버그 수정:
+   setTimeout 콜백 시점에 uid를 새로 읽지 않고
+   타이머 시작 시점의 uid를 클로저로 캡처
+   ==================================================== */
+function clearTurnTimer(room) {
+  if (room.currentTrick?.timer) {
+    clearTimeout(room.currentTrick.timer);
+    room.currentTrick.timer = null;
+  }
+}
+
+function startTurnTimer(room) {
+  clearTurnTimer(room);
+  const expectedUserId = currentTurnUserId(room); // ← 지금 이 순간의 uid 캡처
+  room.currentTrick.turnDeadline = new Date(Date.now() + TURN_TIME_LIMIT_SEC * 1000).toISOString();
+  room.currentTrick.timer = setTimeout(() => {
+    // 타이머가 만료될 때 여전히 같은 사람 차례인지 재확인
+    if (currentTurnUserId(room) === expectedUserId) {
+      handlePass(room, expectedUserId, true);
+    }
+  }, TURN_TIME_LIMIT_SEC * 1000);
+}
+
+/* ====================================================
+   트릭 진행
+   ==================================================== */
+function nextConnectedIndex(turnOrder, fromIndex, players) {
+  const n = turnOrder.length;
+  for (let step = 1; step <= n; step++) {
+    const idx = (fromIndex + step) % n;
+    const uid = turnOrder[idx];
+    const p   = players.get(uid);
+    if (p && p.hand.length > 0) return idx;
+  }
+  return -1;
+}
+
+function advanceTurn(room) {
+  const t   = room.currentTrick;
+  const idx = nextConnectedIndex(t.turnOrder, t.currentTurnIndex, room.players);
+  if (idx === -1) return;
+  t.currentTurnIndex = idx;
+  startTurnTimer(room);
+  // 봇 차례면 자동 행동 스케줄
+  scheduleBotActionIfNeeded(room);
+}
+
+function startNewTrick(room, startUserId) {
+  clearTurnTimer(room);
+  const order    = room.seatOrder.filter((uid) => room.players.get(uid)?.hand.length > 0);
+  const startIdx = order.indexOf(startUserId) >= 0 ? order.indexOf(startUserId) : 0;
+  room.currentTrick = {
+    fieldCards:       [],
+    lastPlayedBy:     null,
+    passedPlayers:    new Set(),
+    turnOrder:        order,
+    currentTurnIndex: startIdx,
+    turnDeadline:     null,
+    timer:            null,
+  };
+  startTurnTimer(room);
+  scheduleBotActionIfNeeded(room);
+}
+
+/* ====================================================
+   카드 내기 / 패스
+   ==================================================== */
+function handlePlayCards(room, userId, cardIds) {
+  if (room.status !== "playing") return;
+  if (currentTurnUserId(room) !== userId) return;
+  const p = room.players.get(userId);
+  if (!p) return;
+
+  const cards     = p.hand.filter((c) => cardIds.includes(c.id));
+  if (cards.length !== cardIds.length || cards.length === 0) return;
+
+  const nonJokers = cards.filter((c) => !c.isJoker);
+  const baseRank  = nonJokers.length > 0 ? nonJokers[0].rank : 13;
+  if (!nonJokers.every((c) => c.rank === baseRank)) return;
+
+  const field      = room.currentTrick.fieldCards;
+  const fieldCount = field.length > 0 ? field[field.length - 1].count : null;
+  const fieldRank  = field.length > 0 ? field[field.length - 1].rank  : null;
+
+  if (fieldCount !== null) {
+    if (cards.length !== fieldCount) return;
+    if (baseRank >= fieldRank) return;
+  }
+
+  clearTurnTimer(room);
+
+  p.hand = p.hand.filter((c) => !cardIds.includes(c.id));
+  room.currentTrick.fieldCards.push({ rank: baseRank, count: cards.length, ownerUserId: userId });
+  room.currentTrick.lastPlayedBy = userId;
+  room.currentTrick.passedPlayers.clear();
+
+  sendHandToPlayer(room, userId);
+  io.to(room.roomCode).emit("turn:cardsPlayed", {
+    userId, rank: baseRank, count: cards.length, remainingHandCount: p.hand.length,
   });
 
-  document.getElementById("nicknameInput").oninput = (e) => (state.nickname = e.target.value);
+  if (p.hand.length === 0) {
+    room.finishOrder.push(userId);
+    io.to(room.roomCode).emit("player:finished", { userId, place: room.finishOrder.length });
 
-  document.getElementById("createBtn").onclick = () => {
-    if (!state.nickname.trim()) return showToast("닉네임을 입력해주세요");
-    socket.emit("room:create", { nickname: state.nickname, avatar: state.avatar, userId: state.userId }, (res) => {
-      if (!res || !res.ok) return showToast("방 생성 실패");
-      state.userId = res.userId;
-      state.roomCode = res.roomCode;
-      saveSession();
-    });
-  };
+    const remaining = room.seatOrder.filter((uid) => room.players.get(uid)?.hand.length > 0);
+    if (remaining.length <= 1) {
+      if (remaining.length === 1) room.finishOrder.push(remaining[0]);
+      endRound(room);
+      return;
+    }
+  }
 
-  document.getElementById("joinBtn").onclick = () => {
-    const code = document.getElementById("roomCodeInput").value.trim().toUpperCase();
-    if (!state.nickname.trim()) return showToast("닉네임을 입력해주세요");
-    if (!code) return showToast("입장 코드를 입력해주세요");
-    socket.emit("room:join", { roomCode: code, nickname: state.nickname, avatar: state.avatar, userId: state.userId }, (res) => {
-      if (!res || !res.ok) return showToast(res?.code === "ROOM_FULL" ? "방이 가득 찼습니다" : "방을 찾을 수 없습니다");
-      state.userId = res.userId;
-      state.roomCode = res.roomCode;
-      saveSession();
-    });
-  };
+  room.currentTrick.turnOrder = room.seatOrder.filter((uid) => room.players.get(uid)?.hand.length > 0);
+  const curIdx = room.currentTrick.turnOrder.indexOf(userId);
+  room.currentTrick.currentTurnIndex = curIdx >= 0 ? curIdx : 0;
+  advanceTurn(room);
+  broadcastRoom(room);
 }
 
-/* ===================== 화면: 대기실 ===================== */
-function renderWaitingRoom() {
-  const room = state.room;
-  const isHost = room.hostUserId === state.userId;
-  const me = room.players.find((p) => p.userId === state.userId);
+function handlePass(room, userId, isTimeout = false) {
+  if (room.status !== "playing") return;
+  if (currentTurnUserId(room) !== userId) return;
 
-  app.innerHTML = `
-    <div class="row">
-      <h1 class="serif" style="color:var(--gold);font-size:22px;">달무티 대기실</h1>
-      <button id="rulesBtn" class="icon-btn">❓ 규칙 보기</button>
-    </div>
-    <p>입장 코드 <span class="room-code">${room.roomCode}</span></p>
-    <div class="player-grid" id="playerGrid"></div>
-    <p style="font-size:12px;color:var(--gold);opacity:.8;">참가 인원 ${room.players.length} / ${room.maxPlayers} (최소 ${room.minPlayers}명)</p>
-    <div class="actions">
-      <button id="readyBtn" class="btn" style="flex:1;">${me?.isReady ? "준비 취소" : "준비완료"}</button>
-      ${isHost ? `<button id="startBtn" class="btn btn-gold" style="flex:1;">게임 시작</button>` : ""}
-    </div>
-    <div class="actions" style="margin-top:8px;">
-      <button id="leaveBtn" class="btn" style="flex:1;border-color:var(--muted);color:var(--muted);">🚪 방 나가기</button>
-      ${isHost ? `<button id="closeBtn" class="btn btn-primary" style="flex:1;">❌ 방 삭제</button>` : ""}
-    </div>
-  `;
+  clearTurnTimer(room);
+  room.currentTrick.passedPlayers.add(userId);
+  io.to(room.roomCode).emit("turn:passed", { userId, isTimeout });
 
-  const grid = document.getElementById("playerGrid");
-  room.players.forEach((p) => {
-    const div = document.createElement("div");
-    div.className = "player-card";
-    div.innerHTML = `
-      <span class="avatar">${p.avatar}</span>
-      <span class="name">${p.nickname}${p.userId === room.hostUserId ? " 👑방장" : ""}</span>
-      <span class="status ${p.isReady ? "ready" : ""}">${p.connected === false ? "연결 끊김" : p.isReady ? "준비완료" : "대기중"}</span>
-    `;
-    grid.appendChild(div);
+  const activePlayers = room.currentTrick.turnOrder;
+  const stillIn       = activePlayers.filter(
+    (uid) => !room.currentTrick.passedPlayers.has(uid) && room.players.get(uid)?.hand.length > 0
+  );
+
+  if (stillIn.length === 0) {
+    const winner   = room.currentTrick.lastPlayedBy
+      || activePlayers.find((uid) => room.players.get(uid)?.hand.length > 0)
+      || activePlayers[0];
+    io.to(room.roomCode).emit("trick:allPassed", { winnerUserId: winner });
+    const fallback = room.seatOrder.find((uid) => room.players.get(uid)?.hand.length > 0 && uid !== winner) || winner;
+    const next     = room.players.get(winner)?.hand.length > 0 ? winner : fallback;
+    startNewTrick(room, next);
+    broadcastRoom(room);
+    return;
+  }
+
+  advanceTurn(room);
+  broadcastRoom(room);
+}
+
+/* ====================================================
+   라운드 종료 / 신분 재배정
+   ==================================================== */
+function endRound(room) {
+  clearTurnTimer(room);
+  room.seatOrder.forEach((uid) => {
+    if (!room.finishOrder.includes(uid)) room.finishOrder.push(uid);
   });
 
-  document.getElementById("rulesBtn").onclick = () => rulesModal.classList.remove("hidden");
-  document.getElementById("readyBtn").onclick = () => socket.emit("player:ready");
-
-  document.getElementById("leaveBtn").onclick = () => {
-    if (!confirm("방에서 나가시겠습니까?")) return;
-    leaveRoom();
-  };
-
-  const closeBtn = document.getElementById("closeBtn");
-  if (closeBtn) {
-    closeBtn.onclick = () => {
-      if (!confirm("방을 삭제하면 모든 플레이어가 강제 퇴장됩니다. 삭제하시겠습니까?")) return;
-      socket.emit("room:close");
+  room.finishOrder.forEach((uid, i) => {
+    const p = room.players.get(uid);
+    if (!p) return;
+    const level = i + 1;
+    p.rank = {
+      title:   RANK_TITLES[Math.min(level, 12) - 1],
+      level,
+      isKing:  level === 1,
+      isPeon:  level === room.finishOrder.length,
     };
-  }
+  });
 
-  const startBtn = document.getElementById("startBtn");
-  if (startBtn) {
-    const canStart = room.players.length >= room.minPlayers && room.players.length <= room.maxPlayers;
-    startBtn.disabled = !canStart;
-    startBtn.onclick = () => socket.emit("game:start");
-  }
+  room.seatOrder = [...room.finishOrder];
+  room.seatOrder.forEach((uid, i) => {
+    const p = room.players.get(uid);
+    if (p) p.seatIndex = i;
+  });
 
-  if (!rulesAutoShown) {
-    rulesModal.classList.remove("hidden");
-    rulesAutoShown = true;
-  }
+  room.status = "roundEnd";
+  io.to(room.roomCode).emit("round:ended", { finishOrder: room.finishOrder });
+  broadcastRoom(room);
+
+  setTimeout(() => startNewRound(room), 4000);
 }
 
-/* ===================== 화면: 세금 징수 ===================== */
-function renderTax() {
-  const room = state.room;
-  const tax = room.taxExchange;
-  const isKing = tax.kingId === state.userId;
-  const isPeon = tax.peonId === state.userId;
-  const myJokers = state.myHand.filter((c) => c.isJoker).length;
+function startNewRound(room) {
+  room.roundNumber += 1;
+  room.finishOrder = [];
 
-  app.innerHTML = `
-    <div class="row">
-      <h1 class="serif" style="color:var(--gold);font-size:20px;">세금 징수 (라운드 ${room.roundNumber})</h1>
-      <div style="display:flex;gap:6px;">
-        <button id="rulesBtn" class="icon-btn">❓ 규칙 보기</button>
-        <button id="leaveBtn" class="icon-btn" style="border-color:var(--muted);color:var(--muted);">🚪 나가기</button>
-      </div>
-    </div>
-    <div class="tax-box">
-      ${isKing ? "<p>👑 왕입니다. 노예에게 내려줄 카드를 선택하세요.</p>" : ""}
-      ${isPeon ? "<p>🪓 노예입니다. 왕에게 바칠 가장 좋은 카드를 선택하세요.</p>" : ""}
-      ${!isKing && !isPeon ? "<p>왕과 노예 사이의 세금 징수가 진행 중입니다...</p>" : ""}
-    </div>
-    ${isKing || isPeon ? `<div class="hand" id="taxHand"></div><div class="actions"><button id="taxSubmitBtn" class="btn btn-primary">제출</button></div>` : ""}
-    ${myJokers >= 2 ? `<div class="actions"><button id="revolutionBtn" class="btn btn-gold">⚡ 혁명 선언 (조커 2장 보유)</button></div>` : ""}
-  `;
+  const playerIds = room.seatOrder;
+  const { hands } = dealCards(playerIds.length);
+  playerIds.forEach((uid, i) => {
+    const p = room.players.get(uid);
+    if (p) p.hand = hands[i];
+  });
+  playerIds.forEach((uid) => sendHandToPlayer(room, uid));
 
-  document.getElementById("rulesBtn").onclick = () => rulesModal.classList.remove("hidden");
-  document.getElementById("leaveBtn").onclick = () => {
-    if (!confirm("게임 도중 나가면 대기실로 초기화됩니다. 나가시겠습니까?")) return;
-    leaveRoom();
-  };
-
-  const revBtn = document.getElementById("revolutionBtn");
-  if (revBtn) revBtn.onclick = () => socket.emit("tax:declareRevolution");
-
-  if (isKing || isPeon) {
-    const handDiv = document.getElementById("taxHand");
-    let picked = null;
-    state.myHand.forEach((card) => {
-      const b = document.createElement("button");
-      b.className = "hand-card";
-      b.textContent = card.isJoker ? "🃏" : card.rank;
-      b.onclick = () => {
-        picked = card.id;
-        [...handDiv.children].forEach((c) => c.classList.remove("selected"));
-        b.classList.add("selected");
+  if (room.roundNumber === 1) {
+    const shuffled = [...playerIds].sort(() => Math.random() - 0.5);
+    shuffled.forEach((uid, i) => {
+      const p = room.players.get(uid);
+      const level = i + 1;
+      p.rank = {
+        title:  RANK_TITLES[Math.min(level, 12) - 1],
+        level,
+        isKing: level === 1,
+        isPeon: level === shuffled.length,
       };
-      handDiv.appendChild(b);
     });
-    document.getElementById("taxSubmitBtn").onclick = () => {
-      if (!picked) return showToast("카드를 선택해주세요");
-      socket.emit(isKing ? "tax:kingSubmit" : "tax:peonSubmit", { cardId: picked });
-    };
+    room.status = "playing";
+    broadcastRoom(room);
+    startNewTrick(room, room.seatOrder[0]);
+    broadcastRoom(room);
+    return;
   }
+
+  // 세금 징수 (봇 자동 처리 포함)
+  const kingId = room.seatOrder[0];
+  const peonId = room.seatOrder[room.seatOrder.length - 1];
+  room.taxExchange = { phase: "pending", kingId, peonId };
+  room.status = "tax";
+  broadcastRoom(room);
+  io.to(room.roomCode).emit("tax:phaseStart", { kingId, peonId });
+
+  // 봇이 왕이거나 노예면 자동 처리
+  scheduleBotTaxIfNeeded(room);
 }
 
-/* ===================== 화면: 게임 테이블 ===================== */
-function renderGameTable() {
-  const room = state.room;
-  const trick = room.currentTrick;
-  const isMyTurn = trick?.currentTurnUserId === state.userId;
+function finalizeTaxAndStartRound(room) {
+  room.taxExchange.phase = "completed";
+  room.status = "playing";
+  broadcastRoom(room);
+  startNewTrick(room, room.taxExchange.kingId);
+  broadcastRoom(room);
+}
 
-  app.innerHTML = `
-    <div class="row">
-      <div class="timer-bar-wrap">
-        <div class="timer-bar"><div class="timer-bar-fill" id="timerFill" style="width:100%"></div></div>
-        <span class="timer-text" id="timerText">30s</span>
-      </div>
-      <div style="display:flex;gap:6px;">
-        <button id="rulesBtn" class="icon-btn">❓ 규칙 보기</button>
-        <button id="leaveBtn" class="icon-btn" style="border-color:var(--muted);color:var(--muted);">🚪 나가기</button>
-      </div>
-    </div>
+function checkTaxComplete(room) {
+  const { kingId, peonId, kingCard, peonCard } = room.taxExchange;
+  if (!kingCard || !peonCard) return;
+  const king = room.players.get(kingId);
+  const peon = room.players.get(peonId);
+  king.hand = king.hand.filter((c) => c.id !== kingCard.id).concat(peonCard);
+  peon.hand = peon.hand.filter((c) => c.id !== peonCard.id).concat(kingCard);
+  [king, peon].forEach((p) =>
+    p.hand.sort((a, b) => (a.isJoker ? 1 : 0) - (b.isJoker ? 1 : 0) || a.rank - b.rank)
+  );
+  sendHandToPlayer(room, kingId);
+  sendHandToPlayer(room, peonId);
+  io.to(room.roomCode).emit("tax:completed", { kingId, peonId });
+  finalizeTaxAndStartRound(room);
+}
 
-    <div class="player-grid" id="playerGrid"></div>
-    <div class="field" id="field"></div>
-    <div class="hand" id="hand"></div>
+/* ====================================================
+   봇 AI
+   ==================================================== */
 
-    <div class="actions">
-      <button id="passBtn" class="btn" ${isMyTurn ? "" : "disabled"}>패스</button>
-      <button id="playBtn" class="btn btn-primary" ${isMyTurn ? "" : "disabled"}>카드 내기</button>
-    </div>
-  `;
+/** 봇이 낼 수 있는 최적의 카드 조합을 반환 (없으면 null) */
+function botChooseCards(hand, fieldCards) {
+  const field      = fieldCards;
+  const fieldCount = field.length > 0 ? field[field.length - 1].count : null;
+  const fieldRank  = field.length > 0 ? field[field.length - 1].rank  : null;
 
-  document.getElementById("rulesBtn").onclick = () => rulesModal.classList.remove("hidden");
-  document.getElementById("leaveBtn").onclick = () => {
-    if (!confirm("게임 도중 나가면 대기실로 초기화됩니다. 나가시겠습니까?")) return;
-    leaveRoom();
-  };
+  // 비어있으면 → 손에서 가장 약한 카드 N장 (N=1부터)
+  if (fieldCount === null) {
+    // 일반 카드 중 가장 많이 모인 rank부터 시도 (전략: 많이 모인 패로 바닥 깔기)
+    const groups = {};
+    hand.filter((c) => !c.isJoker).forEach((c) => {
+      if (!groups[c.rank]) groups[c.rank] = [];
+      groups[c.rank].push(c);
+    });
+    const sorted = Object.values(groups).sort((a, b) => b.length - a.length || a[0].rank - b[0].rank);
+    if (sorted.length > 0) return sorted[0].map((c) => c.id);
+    // 조커만 있으면 조커 1장
+    const joker = hand.find((c) => c.isJoker);
+    if (joker) return [joker.id];
+    return null;
+  }
 
-  const grid = document.getElementById("playerGrid");
-  room.players.forEach((p) => {
-    const div = document.createElement("div");
-    const level = p.rank?.level || 6;
-    div.className = "player-card"
-      + (p.rank?.isKing ? " king" : "")
-      + (p.rank?.isPeon ? " peon" : "")
-      + (trick?.currentTurnUserId === p.userId ? " current-turn" : "");
-    div.innerHTML = `
-      ${p.rank?.isKing ? `<span class="crown">👑</span>` : ""}
-      <span class="avatar">${p.avatar}</span>
-      <span class="name">${p.nickname}</span>
-      <span class="title">${p.rank ? RANK_TITLES[Math.min(level, 12) - 1] : ""}</span>
-      <span class="status">카드 ${p.handCount}장</span>
-    `;
-    grid.appendChild(div);
+  // 필드가 있으면 → 같은 장수이면서 더 강한(숫자 작은) 카드 조합 탐색
+  const nonJokers = hand.filter((c) => !c.isJoker);
+  const jokers    = hand.filter((c) => c.isJoker);
+  const groups    = {};
+  nonJokers.forEach((c) => {
+    if (!groups[c.rank]) groups[c.rank] = [];
+    groups[c.rank].push(c);
   });
 
-  const fieldDiv = document.getElementById("field");
-  if (!trick || trick.fieldCards.length === 0) {
-    fieldDiv.innerHTML = `<span class="empty">아직 낸 카드가 없습니다</span>`;
-  } else {
-    trick.fieldCards.forEach((fc) => {
-      const c = document.createElement("div");
-      c.className = "field-card";
-      c.textContent = `${fc.rank}×${fc.count}`;
-      fieldDiv.appendChild(c);
-    });
-  }
+  // 완전히 같은 장수인 그룹 중 fieldRank보다 작은 것
+  const candidates = Object.values(groups)
+    .filter((g) => g.length >= fieldCount && g[0].rank < fieldRank)
+    .sort((a, b) => b[0].rank - a[0].rank); // 가장 약한 것부터 (조금씩 올리기)
 
-  const handDiv = document.getElementById("hand");
-  state.myHand.forEach((card) => {
-    const b = document.createElement("button");
-    b.className = "hand-card" + (state.selected.has(card.id) ? " selected" : "");
-    b.textContent = card.isJoker ? "🃏" : card.rank;
-    b.onclick = () => {
-      if (state.selected.has(card.id)) state.selected.delete(card.id);
-      else state.selected.add(card.id);
-      renderGameTable();
-    };
-    handDiv.appendChild(b);
-  });
+  if (candidates.length > 0) return candidates[0].slice(0, fieldCount).map((c) => c.id);
 
-  document.getElementById("passBtn").onclick = () => socket.emit("turn:pass");
-  document.getElementById("playBtn").onclick = () => {
-    if (state.selected.size === 0) return showToast("카드를 선택해주세요");
-    socket.emit("turn:playCards", { cardIds: Array.from(state.selected) });
-    state.selected.clear();
-  };
-
-  clearInterval(timerInterval);
-  if (trick?.turnDeadline) {
-    const update = () => {
-      const remaining = Math.max(0, Math.ceil((new Date(trick.turnDeadline) - new Date()) / 1000));
-      const fill = document.getElementById("timerFill");
-      const text = document.getElementById("timerText");
-      if (fill) fill.style.width = `${(remaining / 30) * 100}%`;
-      if (text) text.textContent = `${remaining}s`;
-    };
-    update();
-    timerInterval = setInterval(update, 250);
-  }
-}
-
-/* ===================== 라우터 ===================== */
-function render() {
-  const room = state.room;
-  if (!room) return renderHome();
-  if (room.status === "waiting") return renderWaitingRoom();
-  if (room.status === "tax") return renderTax();
-  if (room.status === "playing" || room.status === "roundEnd") return renderGameTable();
-  return renderHome();
-}
-
-/* ===================== 소켓 이벤트 ===================== */
-socket.on("connect", () => {
-  if (state.userId && state.roomCode) {
-    socket.emit("room:join", {
-      roomCode: state.roomCode,
-      nickname: state.nickname,
-      avatar: state.avatar,
-      userId: state.userId,
-    }, (res) => {
-      if (!res || !res.ok) {
-        state.roomCode = null;
-        localStorage.removeItem("dalmuti_roomCode");
+  // 조커를 활용: 조커 N장 + 같은 rank (N-joker)장 조합
+  if (jokers.length > 0) {
+    for (const jCount of [1, 2].slice(0, jokers.length)) {
+      const needed = fieldCount - jCount;
+      if (needed < 0) continue;
+      if (needed === 0) {
+        // 조커만으로 내기 (필드가 비어있을 때만 의미있지만, 단독 조커는 rank 13으로 취급)
+        // 조커 단독은 가장 약하므로 fieldRank < 13 이어야 통과 가능한데, rank 13은 최약이므로 패스
+        continue;
       }
-      render();
-    });
-  } else {
-    render();
+      const pair = Object.values(groups)
+        .filter((g) => g.length >= needed && g[0].rank < fieldRank)
+        .sort((a, b) => b[0].rank - a[0].rank);
+      if (pair.length > 0) {
+        return [
+          ...jokers.slice(0, jCount).map((c) => c.id),
+          ...pair[0].slice(0, needed).map((c) => c.id),
+        ];
+      }
+    }
   }
+
+  return null; // 낼 카드 없음 → 패스
+}
+
+function scheduleBotActionIfNeeded(room) {
+  const uid = currentTurnUserId(room);
+  if (!uid) return;
+  const p = room.players.get(uid);
+  if (!p || !p.isBot) return;
+
+  setTimeout(() => {
+    // 여전히 이 봇 차례인지 확인
+    if (!room.players.has(uid)) return;
+    if (currentTurnUserId(room) !== uid) return;
+    if (room.status !== "playing") return;
+
+    const cards = botChooseCards(p.hand, room.currentTrick?.fieldCards || []);
+    if (cards) {
+      handlePlayCards(room, uid, cards);
+    } else {
+      handlePass(room, uid, false);
+    }
+  }, BOT_THINK_MS + Math.random() * 800);
+}
+
+function scheduleBotTaxIfNeeded(room) {
+  const { kingId, peonId } = room.taxExchange;
+  const king = room.players.get(kingId);
+  const peon = room.players.get(peonId);
+
+  // 봇 노예: 가장 좋은 카드(rank 최소) 자동 제출
+  if (peon?.isBot) {
+    setTimeout(() => {
+      if (room.status !== "tax") return;
+      if (room.taxExchange.peonCard) return;
+      const best = peon.hand
+        .filter((c) => !c.isJoker)
+        .sort((a, b) => a.rank - b.rank)[0]
+        || peon.hand[0];
+      if (!best) return;
+      room.taxExchange.peonCard = best;
+      checkTaxComplete(room);
+    }, BOT_THINK_MS);
+  }
+
+  // 봇 왕: 가장 쓸모없는 카드(rank 최대) 자동 제출
+  if (king?.isBot) {
+    setTimeout(() => {
+      if (room.status !== "tax") return;
+      if (room.taxExchange.kingCard) return;
+      const worst = king.hand
+        .filter((c) => !c.isJoker)
+        .sort((a, b) => b.rank - a.rank)[0]
+        || king.hand[0];
+      if (!worst) return;
+      room.taxExchange.kingCard = worst;
+      checkTaxComplete(room);
+    }, BOT_THINK_MS + 200);
+  }
+}
+
+/* ====================================================
+   소켓 이벤트
+   ==================================================== */
+io.on("connection", (socket) => {
+
+  socket.on("room:create", ({ nickname, avatar, userId }, cb) => {
+    const uid      = userId || uuidv4();
+    const roomCode = makeRoomCode();
+    const room = {
+      roomCode,
+      hostUserId:  uid,
+      status:      "waiting",
+      maxPlayers:  8,
+      minPlayers:  4,
+      roundNumber: 0,
+      players:     new Map(),
+      seatOrder:   [],
+      finishOrder: [],
+      currentTrick: null,
+      taxExchange:  null,
+    };
+    rooms.set(roomCode, room);
+    joinRoomInternal(room, socket, uid, nickname, avatar, false);
+    cb?.({ ok: true, roomCode, userId: uid });
+  });
+
+  socket.on("room:join", ({ roomCode, nickname, avatar, userId }, cb) => {
+    const room = rooms.get((roomCode || "").toUpperCase());
+    if (!room) return cb?.({ ok: false, code: "ROOM_NOT_FOUND" });
+
+    const uid      = userId || uuidv4();
+    const existing = room.players.get(uid);
+    if (!existing && room.players.size >= room.maxPlayers) {
+      return cb?.({ ok: false, code: "ROOM_FULL" });
+    }
+    joinRoomInternal(room, socket, uid, nickname, avatar, false);
+    cb?.({ ok: true, roomCode: room.roomCode, userId: uid });
+  });
+
+  // 봇 추가 (호스트 전용, 대기실에서만)
+  socket.on("room:addBot", () => {
+    const room = rooms.get(socket.data.roomCode);
+    if (!room) return;
+    if (socket.data.userId !== room.hostUserId) return;
+    if (room.status !== "waiting") return;
+    if (room.players.size >= room.maxPlayers) return;
+
+    const botIdx = [...room.players.values()].filter((p) => p.isBot).length;
+    const botId  = `bot_${uuidv4()}`;
+    const bot = {
+      userId:    botId,
+      socketId:  null,
+      nickname:  BOT_NAMES[botIdx % BOT_NAMES.length],
+      avatar:    BOT_AVATARS[botIdx % BOT_AVATARS.length],
+      isBot:     true,
+      seatIndex: room.seatOrder.length,
+      rank:      null,
+      hand:      [],
+      connected: true,
+      isReady:   true, // 봇은 항상 준비완료
+    };
+    room.players.set(botId, bot);
+    room.seatOrder.push(botId);
+    broadcastRoom(room);
+  });
+
+  // 봇 제거 (호스트 전용)
+  socket.on("room:removeBot", () => {
+    const room = rooms.get(socket.data.roomCode);
+    if (!room) return;
+    if (socket.data.userId !== room.hostUserId) return;
+    if (room.status !== "waiting") return;
+
+    const botId = [...room.seatOrder].reverse().find((uid) => room.players.get(uid)?.isBot);
+    if (!botId) return;
+    room.players.delete(botId);
+    room.seatOrder = room.seatOrder.filter((id) => id !== botId);
+    broadcastRoom(room);
+  });
+
+  function joinRoomInternal(room, socket, uid, nickname, avatar, isBot) {
+    socket.join(room.roomCode);
+    socket.data.userId   = uid;
+    socket.data.roomCode = room.roomCode;
+
+    const existingSession = sessions.get(uid);
+    if (existingSession?.disconnectTimer) clearTimeout(existingSession.disconnectTimer);
+
+    let player = room.players.get(uid);
+    if (player) {
+      player.socketId  = socket.id;
+      player.connected = true;
+      if (nickname) player.nickname = nickname;
+      if (avatar)   player.avatar   = avatar;
+      io.to(room.roomCode).emit("player:reconnected", { userId: uid });
+    } else {
+      player = {
+        userId:    uid,
+        socketId:  socket.id,
+        nickname:  nickname || `손님${room.players.size + 1}`,
+        avatar:    avatar   || "🦊",
+        isBot:     false,
+        seatIndex: room.seatOrder.length,
+        rank:      null,
+        hand:      [],
+        connected: true,
+        isReady:   false,
+      };
+      room.players.set(uid, player);
+      room.seatOrder.push(uid);
+    }
+    sessions.set(uid, { roomCode: room.roomCode, disconnectTimer: null });
+
+    if (room.status !== "waiting") sendHandToPlayer(room, uid);
+    broadcastRoom(room);
+  }
+
+  socket.on("player:updateProfile", ({ nickname, avatar }) => {
+    const room = rooms.get(socket.data.roomCode);
+    const p    = room?.players.get(socket.data.userId);
+    if (!p) return;
+    if (nickname) p.nickname = nickname;
+    if (avatar)   p.avatar   = avatar;
+    broadcastRoom(room);
+  });
+
+  socket.on("player:ready", () => {
+    const room = rooms.get(socket.data.roomCode);
+    const p    = room?.players.get(socket.data.userId);
+    if (!p) return;
+    p.isReady = !p.isReady;
+    broadcastRoom(room);
+  });
+
+  socket.on("game:start", () => {
+    const room = rooms.get(socket.data.roomCode);
+    if (!room) return;
+    if (socket.data.userId !== room.hostUserId) return;
+    if (room.players.size < room.minPlayers || room.players.size > room.maxPlayers) return;
+    room.status = "playing";
+    startNewRound(room);
+  });
+
+  socket.on("tax:peonSubmit", ({ cardId }) => {
+    const room = rooms.get(socket.data.roomCode);
+    if (!room || room.status !== "tax") return;
+    const peon = room.players.get(room.taxExchange.peonId);
+    if (!peon || socket.data.userId !== peon.userId) return;
+    const card = peon.hand.find((c) => c.id === cardId);
+    if (!card) return;
+    room.taxExchange.peonCard = card;
+    checkTaxComplete(room);
+  });
+
+  socket.on("tax:kingSubmit", ({ cardId }) => {
+    const room = rooms.get(socket.data.roomCode);
+    if (!room || room.status !== "tax") return;
+    const king = room.players.get(room.taxExchange.kingId);
+    if (!king || socket.data.userId !== king.userId) return;
+    const card = king.hand.find((c) => c.id === cardId);
+    if (!card) return;
+    room.taxExchange.kingCard = card;
+    checkTaxComplete(room);
+  });
+
+  // 혁명 선언 — 전체에게 화려한 알림 포함
+  socket.on("tax:declareRevolution", () => {
+    const room = rooms.get(socket.data.roomCode);
+    if (!room || room.status !== "tax") return;
+    const p = room.players.get(socket.data.userId);
+    const jokerCount = p?.hand.filter((c) => c.isJoker).length || 0;
+    if (jokerCount < 2) return;
+
+    room.taxExchange.phase = "skipped_by_revolution";
+    // 전체 플레이어에게 혁명 상세 정보 (닉네임 포함)
+    io.to(room.roomCode).emit("tax:revolution", {
+      userId:   p.userId,
+      nickname: p.nickname,
+      avatar:   p.avatar,
+    });
+    room.status = "playing";
+    broadcastRoom(room);
+    startNewTrick(room, p.userId);
+    broadcastRoom(room);
+  });
+
+  socket.on("turn:playCards", ({ cardIds }) => {
+    const room = rooms.get(socket.data.roomCode);
+    if (!room) return;
+    handlePlayCards(room, socket.data.userId, cardIds || []);
+  });
+
+  socket.on("turn:pass", () => {
+    const room = rooms.get(socket.data.roomCode);
+    if (!room) return;
+    handlePass(room, socket.data.userId, false);
+  });
+
+  // 방 나가기
+  socket.on("room:leave", () => {
+    const room = rooms.get(socket.data.roomCode);
+    const uid  = socket.data.userId;
+    if (!room || !uid) return;
+
+    clearTurnTimer(room);
+    room.players.delete(uid);
+    room.seatOrder = room.seatOrder.filter((id) => id !== uid);
+    sessions.delete(uid);
+    socket.leave(room.roomCode);
+    socket.data.roomCode = null;
+
+    if (room.players.size === 0) { rooms.delete(room.roomCode); return; }
+
+    if (room.hostUserId === uid) {
+      // 봇이 아닌 첫 번째 사람에게 호스트 이전
+      const newHostId = room.seatOrder.find((id) => !room.players.get(id)?.isBot) || room.seatOrder[0];
+      room.hostUserId = newHostId;
+      const newHost   = room.players.get(newHostId);
+      io.to(room.roomCode).emit("room:hostChanged", { newHostUserId: newHostId, nickname: newHost?.nickname });
+    }
+
+    if (room.status !== "waiting") {
+      room.status      = "waiting";
+      room.currentTrick = null;
+      room.taxExchange  = null;
+      room.finishOrder  = [];
+      room.roundNumber  = 0;
+      room.players.forEach((p) => { p.hand = []; p.isReady = false; p.rank = null; });
+      io.to(room.roomCode).emit("room:resetToLobby", { reason: "플레이어가 나가 대기실로 돌아갑니다." });
+    }
+
+    io.to(room.roomCode).emit("player:left", { userId: uid });
+    broadcastRoom(room);
+  });
+
+  // 방 삭제 (호스트 전용)
+  socket.on("room:close", () => {
+    const room = rooms.get(socket.data.roomCode);
+    if (!room) return;
+    if (socket.data.userId !== room.hostUserId) return;
+
+    clearTurnTimer(room);
+    io.to(room.roomCode).emit("room:closed", { reason: "방장이 방을 닫았습니다." });
+
+    room.players.forEach((p) => {
+      const s = io.sockets.sockets.get(p.socketId);
+      if (s) { s.leave(room.roomCode); s.data.roomCode = null; }
+      sessions.delete(p.userId);
+    });
+    rooms.delete(room.roomCode);
+  });
+
+  socket.on("disconnect", () => {
+    const room = rooms.get(socket.data.roomCode);
+    const uid  = socket.data.userId;
+    if (!room || !uid) return;
+    const p = room.players.get(uid);
+    if (!p || p.isBot) return;
+
+    p.connected = false;
+    io.to(room.roomCode).emit("player:disconnected", { userId: uid, gracePeriodSec: RECONNECT_GRACE_MS / 1000 });
+    broadcastRoom(room);
+
+    const session = sessions.get(uid) || {};
+    session.disconnectTimer = setTimeout(() => {
+      const stillThere = room.players.get(uid);
+      if (stillThere && !stillThere.connected) {
+        room.players.delete(uid);
+        room.seatOrder = room.seatOrder.filter((id) => id !== uid);
+        sessions.delete(uid);
+        broadcastRoom(room);
+        if (room.players.size === 0) { clearTurnTimer(room); rooms.delete(room.roomCode); }
+      }
+    }, RECONNECT_GRACE_MS);
+    sessions.set(uid, session);
+  });
 });
 
-socket.on("room:state", (room) => {
-  state.room = room;
-  render();
-});
-
-socket.on("game:hand", ({ hand }) => {
-  state.myHand = hand;
-  state.selected.clear();
-  render();
-});
-
-socket.on("round:ended", () => showToast("라운드 종료! 다음 라운드를 준비합니다..."));
-socket.on("tax:completed", () => showToast("세금 징수가 완료되었습니다"));
-socket.on("tax:skippedByRevolution", () => showToast("⚡ 혁명 선언! 세금 징수를 건너뜁니다"));
-socket.on("trick:allPassed", () => showToast("모두 패스! 새 턴이 시작됩니다"));
-socket.on("player:disconnected", () => showToast("플레이어 연결이 끊겼습니다 (재접속 대기 중)"));
-socket.on("player:reconnected", () => showToast("플레이어가 재접속했습니다"));
-
-socket.on("player:finished", ({ userId, place }) => {
-  if (userId === state.userId) showToast(`카드를 모두 냈습니다! ${place}등으로 마감`);
-});
-
-socket.on("player:left", ({ userId }) => {
-  const name = state.room?.players?.find(p => p.userId === userId)?.nickname || "플레이어";
-  showToast(`${name}님이 방을 나갔습니다`);
-});
-
-socket.on("room:hostChanged", ({ nickname }) => {
-  showToast(`👑 ${nickname}님이 새 방장이 되었습니다`);
-});
-
-socket.on("room:resetToLobby", ({ reason }) => {
-  state.myHand = [];
-  state.selected.clear();
-  showToast(reason);
-});
-
-// 방장이 방 삭제 → 나를 포함 모두 강제 홈으로
-socket.on("room:closed", ({ reason }) => {
-  showToast(reason || "방이 삭제되었습니다");
-  state.room = null;
-  state.roomCode = null;
-  state.myHand = [];
-  state.selected.clear();
-  rulesAutoShown = false;
-  localStorage.removeItem("dalmuti_roomCode");
-  clearInterval(timerInterval);
-  render();
-});
-
-render();
+server.listen(PORT, () => console.log(`달무티 서버 실행 중: http://localhost:${PORT}`));
